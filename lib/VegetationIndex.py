@@ -1,0 +1,1881 @@
+import os.path
+from typing import Union, Tuple
+from PIL import Image
+import colorsys
+import logging
+
+import cv2 as cv
+import matplotlib.pyplot as plt
+import numpy as np
+from mpl_toolkits.mplot3d import Axes3D
+import datetime
+import argparse
+from skimage.color import rgb2yiq
+import plotly.graph_objects as go
+
+#import viplab_lib as vip
+
+from mpl_toolkits import mplot3d
+
+from ImageManipulation import ImageManipulation
+from DepthImage import DepthImage
+#
+# If the CUDA libraries cannot be imported, disable GPU support
+# Nano vs PC, usually
+#
+try:
+    import pycuda.autoinit
+    from pycuda.compiler import SourceModule
+
+    import pycuda.gpuarray as gpuarray
+    import pycuda.driver as cuda
+    import pycuda.autoinit
+    # TODO: Make this a command line optiopn
+    GPU_ENABLED = False
+except ImportError:
+    GPU_ENABLED = False
+
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import minmax_scale
+import pandas as pd
+
+OTSU = "OTSU"
+TRIANGLE = "TRIANGLE"
+
+KEYWORD_EQUALIZE = "equalize"
+
+ALG_NDI = "ndi"
+ALG_TGI = "tgi"
+ALG_EXG = "exg"
+ALG_EXR = "exr"
+ALG_EXGEXR = "exgexr"
+ALG_CIVE = "cive"
+ALG_NGRDI = "ngrdi"
+ALG_VEG = "veg"
+ALG_COM1 = "com1"
+ALG_MEXG = "mexg"
+ALG_COM2 = "com2"
+ALG_RGD = "rgd"
+ALG_SI = "si"
+# self.ALG_DGCI="dgci"
+ALG_DI = "di"
+ALG_YCBCRI = "ycbcri"
+ALG_HV = "hv"
+ALG_HI = "hi"
+ALG_CI = "ci"
+
+# Ths "best" thresholds technique to use
+thresholds = {"NDI": OTSU,
+              "EXG": OTSU,
+              "EXR": OTSU,
+              "CIVE": OTSU,
+              "EXGEXR": OTSU,
+              "NGRDI": OTSU,
+              "VEG": OTSU,
+              "COM1": OTSU,
+              "MEXG": OTSU,
+              "COM2": OTSU,
+              "TGI": OTSU,
+              "DI": OTSU,
+              # "DGCI"  : 0,
+              'EI': OTSU,
+              'YI': OTSU,
+              'HI': OTSU,
+              'HV': OTSU,
+              "YCBCR": OTSU}
+
+class VegetationIndex:
+    """
+    Compute Vegetation Indices for a number of methods and create masks
+    """
+    thresholdChoices = [OTSU, TRIANGLE]
+    algorithmChoices = [ALG_NDI,
+                        ALG_TGI,
+                        ALG_NGRDI,
+                        ALG_EXGEXR,
+                        ALG_EXG,
+                        ALG_EXR,
+                        ALG_CIVE,
+                        ALG_VEG,
+                        ALG_COM1,
+                        ALG_MEXG,
+                        ALG_COM2,
+                        ALG_TGI,
+                        ALG_RGD,
+                        ALG_SI,
+                        ALG_DI,
+                        ALG_YCBCRI,
+                        ALG_HV,
+                        ALG_HI]
+
+
+    def __init__(self):
+        self._log = logging.getLogger("VI")
+        self.initialized = False
+        # Control if the GPU is used or not
+        self._gpuSupported = GPU_ENABLED
+
+        self._images = []
+        self._imageLocation = None
+        self.redBand = np.empty([0,0], dtype=np.uint8)
+        self.greenBand = np.empty([0,0], dtype=np.uint8)
+        self.blueBand = np.empty([0,0], dtype=np.uint8)
+
+        self.redBandMasked = np.empty([0,0], dtype=np.uint8)
+        self.greenBandMasked = np.empty([0,0], dtype=np.uint8)
+        self.blueBandMasked = np.empty([0,0], dtype=np.uint8)
+
+        self.mask = np.empty([0, 0])
+
+        self._depthImage = None
+        self._depth = None
+
+        self.HSV_COLOR_THRESHOLD = 20
+
+        self._threshold = -9999.9
+
+        self.img = None
+        self._imageFromPil = None
+        self._index = None
+
+        self._manipulated = False
+
+        # Band positions for openCV (BGR)
+        self.CV_BLUE = 0
+        self.CV_GREEN = 1
+        self.CV_RED = 2
+
+        # Lambda values for the vegetation indices
+        self.lambdaRed = 670  # nm
+        self.lambdaGreen = 550  # nm
+        self.lambdaBlue = 480  # nm
+
+        self.ALG_NDI="ndi"
+        self.ALG_TGI="tgi"
+        self.ALG_EXG="exg"
+        self.ALG_EXR="exr"
+        self.ALG_EXGEXR="exgexr"
+        self.ALG_CIVE="cive"
+        self.ALG_NGRDI="ngrdi"
+        self.ALG_VEG="veg"
+        self.ALG_COM1="com1"
+        self.ALG_MEXG="mexg"
+        self.ALG_COM2="com2"
+        self.ALG_RGD="rgd"
+        self.ALG_SI="si"
+        #self.ALG_DGCI="dgci"
+        self.ALG_DI="di"
+        self.ALG_YCBCRI="ycbcri"
+        self.ALG_HV="hv"
+
+        self.algorithms = [self.ALG_NDI,
+                           self.ALG_TGI,
+                           self.ALG_NGRDI,
+                           self.ALG_EXGEXR,
+                           self.ALG_EXG,
+                           self.ALG_EXR,
+                           self.ALG_CIVE,
+                           self.ALG_VEG,
+                           self.ALG_COM1,
+                           self.ALG_MEXG,
+                           self.ALG_COM2,
+                           self.ALG_TGI,
+                           self.ALG_RGD,
+                           self.ALG_SI,
+                           #self.ALG_DGCI,
+                           self.ALG_DI,
+                           self.ALG_YCBCRI,
+                           self.ALG_HV]
+
+        thresholds = {"NDI": 0,
+                      "EXG": 200,
+                      "EXR": 40,
+                      "CIVE": 0,
+                      "EXGEXR": 170,
+                      "NGRDI": 0,
+                      "VEG": 0,
+                      "COM1": 300,
+                      "MEXG": 10,
+                      "COM2": 40,
+                      "TGI": 0,
+                      #"DGCI": 0.5,
+                      "DI": 0,
+                      "YCBCRI": 0}
+
+        self.computations = {self.ALG_NDI     : {"description": "Normalized Difference", "create": self.NDI, "threshold": thresholds["NDI"]},
+                             self.ALG_EXG     : {"description": "Excess Green", "create": self.ExG, "threshold": thresholds["EXG"]},
+                             self.ALG_EXR     : {"description": "Excess Red", "create": self.ExR, "threshold": thresholds["EXR"]},
+                             self.ALG_CIVE    : {"description": "Color Index of Vegetation Extraction", "create": self.CIVE, "threshold": thresholds["CIVE"]},
+                             self.ALG_EXGEXR  : {"description": "Excess Green - Excess Red", "create": self.ExGR, "threshold": thresholds["EXGEXR"]},
+                             self.ALG_NGRDI   : {"description": "Normalized Green Red Difference", "create": self.NGRDI, "threshold": thresholds["NGRDI"]},
+                             self.ALG_VEG     : {"description": "Vegetative Index", "create": self.VEG, "threshold": thresholds["VEG"]},
+                             self.ALG_COM1    : {"description": "Combined Index 1", "create": self.COM1, "threshold": thresholds["COM1"]} ,
+                             self.ALG_MEXG    : {"description": "Modified Excess Green", "create": self.MExG, "threshold": thresholds["MEXG"]},
+                             self.ALG_COM2    : {"description": "Combined Index 2", "create": self.COM2, "threshold": thresholds["COM2"]},
+                             self.ALG_TGI     : {"description": "TGI", "create": self.TGI, "threshold": thresholds["TGI"]},
+                             self.ALG_RGD     : {"description": "Red Green Dots", "create": self.redGreenDots, "threshold": 0},
+                             self.ALG_SI      : {"description": "Blue Spray Indicator", "create": self.SI, "threshold": 0},
+                             #self.ALG_DGCI    : {"description": "Dark Green Color", "create": self.DGCI, "threshold": thresholds["DGCI"]},
+                             self.ALG_DI      : {"description": "Depth Index", "create": self.DI, "threshold": thresholds["DI"]},
+                             self.ALG_YCBCRI  : {"description": "YCBCRI", "create": self.YCbCrI, "threshold": thresholds["YCBCRI"]}
+                             }
+
+    def images(self) -> []:
+        raise NotImplementedError
+
+    @property
+    def gpuSupported(self) -> bool:
+        return self._gpuSupported
+
+    @property
+    def threshold(self) -> float:
+        return self._threshold
+
+    def Index(self, name: str) -> np.ndarray:
+        """
+        Compute the named index
+        :param name:
+        The name of the algorithm.  Use GetSupportedAlgorithms() for a list.
+        :return:
+        The index as an ndarray
+        """
+        algorithm = self.computations[name]
+        self._index = algorithm["create"]()
+        return self._index
+
+    def GetImageStats(self, target: np.ndarray):
+        nonZeroCells = np.count_nonzero(target > 0, keepdims=False)
+        count = (target != 0.0).sum()
+        return nonZeroCells
+
+    def ShowStats(self, target: np.ndarray):
+        nonZeroCells = np.count_nonzero(target)
+
+        print("Nonzero cells:", nonZeroCells)
+
+    def SaveIndexToFile(self,name: str, index: np.ndarray):
+        cv.imwrite(name, index)
+
+    def GetImage(self) -> np.ndarray:
+        return self.img
+
+    # The VIP routine is quite slow. This routine should not be used
+    def GetMaskedImage(self) -> np.ndarray:
+        # maskedRGB = vip.Image_getBGR(self.redBandMasked, self.greenBandMasked, self.blueBandMasked, 8000)
+        assert(False)
+        return maskedRGB
+
+    # The opencv routine is fast, but seems to introduce some noise in the image
+    # that must be cleaned up later.
+    def GetImage(self):
+        maskedRGB = cv.merge((self.blueBandMasked, self.greenBandMasked, self.redBandMasked))
+        return maskedRGB
+
+    def ReplaceNonZeroPixels(self, image: np.ndarray, value : float) -> np.ndarray:
+        cartooned = np.where(image > 0, value, image)
+        return cartooned
+
+    #TODO: Move to utility
+    def SaveImage(self, image: np.ndarray, name: str):
+        data = Image.fromarray((image * 255).astype(np.uint8))
+        data.save(name)
+
+    #TODO: Move to utility -- nothing to do with this
+    def SaveMaskedImage(self, name: str):
+        """
+        Save the RGB image to a file
+        :type file: str
+        :type RGBImage: np.ndarray
+        """
+        data = Image.fromarray((self.GetMaskedImage() * 255).astype(np.uint8))
+        data.save(name)
+
+    @property
+    def depth(self) -> np.ndarray:
+        """
+        Depth data corresponding to the RGB image
+        :return:
+        """
+        return self._depth
+
+    @depth.setter
+    def depth(self, theDepth: np.ndarray):
+        """
+        Assign depth data corresponding to RGB image
+        :param theDepth:
+        """
+        self._depth = theDepth
+
+    def SetDepth(self, depth: np.ndarray):
+        """
+        Set the depth data
+        :param depth: numpy array of depth readings
+        """
+        assert False
+        #self._depth = DepthImage(depth)
+
+    def SetImage(self, image: np.ndarray):
+        # W A R N I N G
+        # debug memory
+        # normalized = np.zeros_like(image)
+        # finalImage = cv.normalize(image,  normalized, 0, 255, cv.NORM_MINMAX)
+        finalImage = cv.normalize(image,  None, 0, 255, cv.NORM_MINMAX)
+        self.img = finalImage
+
+        self.imgNP: np.ndarray
+        self.imgNP = np.array(self.img).astype(dtype=np.int16)
+
+        # If we want to compute the index on the GPU, copy the bands to it
+        # The computation routines do not require changes if they are called the same thing.
+        if self.gpuSupported:
+            self._log.debug("Using GPU")
+            self.gpuRedBand = cuda.mem_alloc(self.imgNP[:,:,self.CV_RED].nbytes)
+            cuda.memcpy_htod(self.gpuRedBand, np.ascontiguousarray(self.imgNP[:,:,self.CV_RED]))
+            self.gpuGreenBand = cuda.mem_alloc(self.imgNP[:,:,self.CV_GREEN].nbytes)
+            cuda.memcpy_htod(self.gpuGreenBand, np.ascontiguousarray(self.imgNP[:,:,self.CV_GREEN]))
+            self.gpuBlueBand = cuda.mem_alloc(self.imgNP[:,:,self.CV_BLUE].nbytes)
+            cuda.memcpy_htod(self.gpuBlueBand, np.ascontiguousarray(self.imgNP[:,:,self.CV_BLUE]))
+
+            # Shortcut way
+            self.redBand = gpuarray.to_gpu(self.imgNP[:, :, self.CV_RED])
+            self.greenBand = gpuarray.to_gpu(self.imgNP[:, :, self.CV_GREEN])
+            self.blueBand = gpuarray.to_gpu(self.imgNP[:, :, self.CV_BLUE])
+        else:
+            self._log.debug("Using CPU")
+            self.redBand = self.imgNP[:, :, self.CV_RED]
+            self.greenBand = self.imgNP[:, :, self.CV_GREEN]
+            self.blueBand = self.imgNP[:, :, self.CV_BLUE]
+
+            # Keep a copy or the originals, as the bands may be manipulated before the mask is applied
+            self.redBandOriginal = np.copy(self.redBand)
+            self.greenBandOriginal = np.copy(self.greenBand)
+            self.blueBandOriginal = np.copy(self.blueBand)
+
+
+    # This is just a hack so we can debug the DGCI code
+    # def TemporaryLoad(self, location: str):
+    #     self._imageFromPil = Image.open(location)
+
+    def Unload(self):
+        """
+        Debug memory leak
+        """
+        self.img = None
+        self.imgNP = None
+        self._index = None
+        self.redBand = None
+        self.redBandMasked = None
+        self.redBandOriginal = None
+        self.blueBand = None
+        self.blueBandMasked = None
+        self.blueBandOriginal = None
+        self.greenBand = None
+        self.greenBandMasked = None
+        self.greenBandOriginal = None
+        self._imageFromPil = None
+        self._images = []
+
+
+    def Load(self, location: str, **kwargs):
+
+        equalize = False
+
+        if KEYWORD_EQUALIZE in kwargs:
+            equalize = kwargs[KEYWORD_EQUALIZE]
+
+        self._imageLocation = location
+        self.img = cv.imread(location,cv.IMREAD_COLOR)
+
+        # A bit redundant if the plan is to convert to another color space, as this is thrown away
+        if equalize:
+            print(f"Equalizing the histogram")
+            img = cv.cvtColor(self.img, cv.COLOR_BGR2HSV)
+            img[:, :, 2] = cv.equalizeHist(img[:, :, 2])
+            self.img = cv.cvtColor(img.astype(np.uint8), cv.COLOR_HSV2BGR)
+
+        # https://github.com/mcelrjo/pygreenturf/blob/master/pyGreenTurf_0.2.5.py
+        self._imageFromPil = Image.open(location)
+
+        # Original
+        # self.imgNP = np.array(self.img).astype(dtype=np.int16)
+        # self.redBand = self.imgNP[:, :, self.CV_RED]
+        # self.greenBand = self.imgNP[:, :, self.CV_GREEN]
+        # self.blueBand = self.imgNP[:, :, self.CV_BLUE]
+
+        # If we want to compute the index on the GPU, copy the bands to it
+        # The computation routines do not require changes if they are called the same thing.
+        self.imgNP = np.ndarray
+        self.imgNP = np.array(self.img).astype(dtype=np.int16)
+        if self.gpuSupported:
+            print("Using GPU")
+            # Allocate the memory on the GPU
+            self.gpuRedBand = cuda.mem_alloc(self.imgNP[:,:,self.CV_RED].nbytes)
+            # Copy the numpy array to its counterpart on the GPU.
+            # This needs to be a contiguous array to work properly
+            cuda.memcpy_htod(self.gpuRedBand, np.ascontiguousarray(self.imgNP[:,:,self.CV_RED]))
+            # Repeat this for the other two bands
+            self.gpuGreenBand = cuda.mem_alloc(self.imgNP[:,:,self.CV_GREEN].nbytes)
+            cuda.memcpy_htod(self.gpuGreenBand, np.ascontiguousarray(self.imgNP[:,:,self.CV_GREEN]))
+            self.gpuBlueBand = cuda.mem_alloc(self.imgNP[:,:,self.CV_BLUE].nbytes)
+            cuda.memcpy_htod(self.gpuBlueBand, np.ascontiguousarray(self.imgNP[:,:,self.CV_BLUE]))
+
+            # Shortcut way
+            # self.redBand = gpuarray.to_gpu(self.imgNP[:, :, self.CV_RED])
+            # self.greenBand = gpuarray.to_gpu(self.imgNP[:, :, self.CV_GREEN])
+            # self.blueBand = gpuarray.to_gpu(self.imgNP[:, :, self.CV_BLUE])
+            print("Transferred to GPU")
+        else:
+            # Keep a copy or the originals, as the bands may be manipulated before the mask is applied
+            self.redBand = self.imgNP[:, :, self.CV_RED]
+            self.redBandOriginal = np.copy(self.redBand)
+            self.greenBand = self.imgNP[:, :, self.CV_GREEN]
+            self.greenBandOriginal = np.copy(self.greenBand)
+            self.blueBand = self.imgNP[:, :, self.CV_BLUE]
+            self.blueBandOriginal = np.copy(self.blueBand)
+
+        #self._images.append(self.img)
+
+        # Display the image
+        #plt.imshow(self.img)
+        #plt.show()
+
+        # This hangs, not sure what is going on here.
+        #cv.imshow("Image", img)
+
+    def normalize(self):
+        """
+        Normalize the bands as described here:\n
+        Guijarro, M., Pajares, G., Riomoros, I., Herrera, P. J., Burgos-Artizzu, X. P., & Ribeiro, A. (2011). Automatic segmentation of relevant textures in agricultural images. Computers and Electronics in Agriculture, 75(1), 75–83. \n
+        Original source: \n
+        Gée, C., Bossu, J., Jones, G., & Truchetet, F. (2008). Crop/weed discrimination in perspective agronomic images. Computers and Electronics in Agriculture, 60(1), 49–59.
+        """
+        maxRed = np.max(self.redBand)
+        maxGreen = np.max(self.greenBand)
+        maxBlue = np.max(self.blueBand)
+
+        # Normalize the individual bands
+        self.redBand = self.redBand / maxRed
+        self.greenBand = self.greenBand / maxGreen
+        self.blueBand = self.blueBand / maxBlue
+
+        # Normalize the combined bands
+
+        # The small value to add to avoid a runtime error when we divide
+        minValue = 1e-5
+
+        # print(f"Red Range: {self.redBand.min()} to {self.redBand.max()}")
+        # print(f"Blue Range: {self.blueBand.min()} to {self.blueBand.max()}")
+        # print(f"Green Range: {self.greenBand.min()} to {self.greenBand.max()}")
+        try:
+            self.redBand = self.redBand / (self.redBand + self.greenBand + self.blueBand + minValue)
+            self.greenBand = self.greenBand / (self.redBand + self.greenBand + self.blueBand + minValue)
+            self.blueBand = self.blueBand / (self.redBand + self.greenBand + self.blueBand + minValue)
+        except RuntimeWarning as warn:
+            print(f"Warning: {warn}")
+
+        self._manipulated = True
+
+
+    def Reload(self):
+        """
+        Reload the current image from the memory buffer, not from disk
+        """
+        self.imgNP = np.array(self.img)
+        self.redBand = self.imgNP[:, :, self.CV_RED]
+        self.greenBand = self.imgNP[:, :, self.CV_GREEN]
+        self.blueBand = self.imgNP[:, :, self.CV_BLUE]
+
+
+    def GetSupportedAlgorithms(self) -> []:
+        return self.algorithms
+
+
+    # def Stitch(self, location: str) -> Image:
+    #
+    #     return None
+
+    # def DI(self, threshold: float) -> np.ndarray:
+    #     """
+    #     Compute an index based on depth data
+    #     :param threshold: threshold of the distance
+    #     :return: numpy array of index
+    #     """
+    #     self._depth.applyThreshold(threshold)
+    #     return self._depth.array
+
+    @property
+    def index(self) -> np.ndarray:
+        return self._index
+
+    def cleanup(self):
+        """
+        Cleanup the depth data
+        """
+
+        if self._depth is None:
+            return
+
+        # Make sure the sizes match
+        heightDepth, widthDepth = self._depth.shape
+        heightIndex, widthIndex = self._index.shape
+        maxval = np.max(self._depth[np.nonzero(self._depth)])
+        minval = np.min(self._depth[np.nonzero(self._depth)])
+        standardDeviation = np.std(self._depth, where=self._depth > 0)
+
+        self._depth[self._depth == 0] = minval
+
+
+
+    def TGI(self) -> np.ndarray:
+        #img = self.images[0]
+
+        # Avoid conversion problems
+        # shape = self.redBand.shape
+        # TGI = np.empty(shape,dtype=np.int16)
+        # TGI_Numerator = np.empty(shape,dtype=np.int16)
+        # TGI_Denominator = np.empty(shape,dtype=np.int16)
+        #
+        # TGI_Numerator = (self.lambdaRed - self.lambdaBlue)\
+        #                 * (self.redBand - self.greenBand) - (self.lambdaRed - self.lambdaGreen) * \
+        #                 (self.redBand - self.blueBand)
+        # TGI_Denominator = 2
+        #
+        #
+        # with np.errstate(divide='ignore', invalid='ignore'):
+        #     TGI =np.true_divide(TGI_Numerator,TGI_Denominator)
+        #     TGI[TGI == np.inf] = 0
+        #     TGI = np.nan_to_num(TGI)
+
+        alpha = (2 * (self.lambdaBlue - self.lambdaGreen)) / (self.lambdaBlue - self.lambdaRed)
+        beta = (2 * (self.lambdaGreen - self.lambdaRed)) / (self.lambdaBlue - self.lambdaRed)
+        alpha = 0.52
+        beta = 0.59
+
+        TGI = self.greenBand - alpha * self.redBand - beta * self.blueBand
+        self._index = TGI
+        self._name = "TGI"
+
+        #MaskTGI = TGI > threshold #0.100
+
+
+        return TGI
+
+    # This is the version that accepts a tuple and considers up/down values
+    def MaskFromIndexTwoThresholds(self, index: np.ndarray, negate: bool, direction: int, threshold: () = None) -> np.ndarray:
+        """
+        Create a mask based on the index
+        :param index:
+        The vegetation index
+        :param threshold:
+        The threshold value to use. If not specified, Otsu's Binarization is used.
+        :return:
+        The mask as a numpy array with RGB channels
+        """
+
+        # TODO: This routine is a mess. Rewrite
+        # If a threshold is not supplied, use Otsu
+        if threshold == None:
+            # Convert to a grayscale#
+            greyScale = index.astype(np.uint8)
+            #ret, thresholdedImage = cv.threshold(greyScale,0,255,cv.THRESH_BINARY+cv.THRESH_OTSU)
+            ret, thresholdedImage = cv.threshold(greyScale,0,255,cv.THRESH_BINARY+cv.THRESH_OTSU)
+            threshold = ret
+            threshold1 = ret
+            threshold2 = -9999
+        else:
+            # Thresholds are (up, down)
+            threshold1 = threshold[0]
+            threshold2 = threshold[1]
+
+        # If the direction is 1, interpret the two thresholds as up, down
+        # To make this go back to the original implementation, set the second threshold to -9999
+
+        if direction > 0:
+            thresholdedIndex = index > threshold1
+            if threshold2 != -9999:
+                thresholdIndex2 = index < threshold2
+                finalMask = np.logical_or(thresholdedIndex, thresholdIndex2)
+            else:
+                finalMask = thresholdedIndex
+            negated = finalMask
+        else:
+            thresholdedIndex = index < threshold1
+            #negated = np.logical_not(thresholdedIndex)
+            negated = thresholdedIndex
+            finalMask = negated
+
+        if negate:
+            finalMask = np.logical_not(thresholdedIndex)
+            #negated = finalMask
+
+        # Touch up the mask with some floodfill
+        filledMask = finalMask.copy().astype(np.uint8)
+        cv.floodFill(filledMask, None, (0,0),255)
+        filledMaskInverted = cv.bitwise_not(filledMask)
+        # finalMask = cv.bitwise_not(filledMaskInverted)
+        # #plt.imshow(finalMask, cmap='gray', vmin=0, vmax=1)
+        # #plt.show()
+        # As we apply this mask as multiplying, convert 255s to 1
+        filledMaskInverted = np.where(filledMaskInverted > 0, 1, filledMaskInverted)
+
+        self.mask = filledMaskInverted
+        finalMask = filledMaskInverted
+
+        negated = filledMaskInverted
+        #negated = np.logical_not(filledMaskInverted)
+        # End floodfill touch up
+
+
+        self.mask = negated
+
+
+        # FYI: the mask value returned here is not used
+        return finalMask, threshold
+
+    def createMask(self, index: np.ndarray, negate: bool, direction: int, threshold: Union[float, str] = None) -> (np.ndarray, int):
+        """
+        Create a mask based on the index
+        :param index: The vegetation index
+        :param negate: If the mask should be negated
+        :param direction: 0 = up, 1= down
+        :param threshold:
+        The threshold value to use. If not specified, Otsu's Binarization is used.
+        :return:
+        (The mask as a numpy array with RGB channels, threshold)
+        """
+
+        # If a threshold is not supplied, use Otsu
+        if threshold == None or threshold == OTSU:
+            # Convert to a grayscale#
+            greyScale = index.astype(np.uint8)
+            # Original
+            #ret, thresholdedImage = cv.threshold(greyScale, 0, 255, cv.THRESH_BINARY+cv.THRESH_OTSU)
+            # Triangle
+            #self._threshold, thresholdedImage = cv.threshold(greyScale, 0, 255, cv.THRESH_BINARY+cv.THRESH_TRIANGLE)
+            #DEBUG
+            blur = cv.GaussianBlur(greyScale, (7, 7), 0)
+            self._threshold, thresholdedImage = cv.threshold(blur, 0, 255, cv.THRESH_BINARY+cv.THRESH_OTSU)
+            #DEBUG
+            #self._threshold, thresholdedImage = cv.threshold(greyScale, 0, 255, cv.THRESH_BINARY+cv.THRESH_OTSU)
+            #th3 = cv.adaptiveThreshold(greyScale, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY, 11, 2)
+            thresholdUsed = self._threshold
+        elif threshold == TRIANGLE:
+            # Convert to a grayscale#
+            greyScale = index.astype(np.uint8)
+            blurred = cv.GaussianBlur(greyScale, (7, 7), 0)
+            self._threshold, thresholdedImage = cv.threshold(blurred, 0, 255, cv.THRESH_BINARY+cv.THRESH_TRIANGLE)
+            thresholdUsed = self._threshold
+        else:
+            thresholdUsed = threshold
+
+        # If the direction is 1, interpret the two thresholds as up, down
+        # To make this go back to the original implementation, set the second threshold to -9999
+
+        if direction > 0:
+            thresholdedIndex = index > thresholdUsed
+            finalMask = thresholdedIndex
+            negated = finalMask
+        else:
+            thresholdedIndex = index < thresholdUsed
+            #negated = np.logical_not(thresholdedIndex)
+            negated = thresholdedIndex
+            finalMask = negated
+
+        if negate:
+            finalMask = np.logical_not(thresholdedIndex)
+            #negated = finalMask
+
+        # DEBUG
+        # normalized = np.zeros_like(finalMask)
+        # debugMask = cv.normalize(finalMask, normalized, 0, 255, cv.NORM_MINMAX)
+        # cv.imwrite("mask-before.jpg", debugMask)
+        # DEBUG
+
+        # Touch up the mask with some floodfill
+        filledMask = finalMask.copy().astype(np.uint8)
+        # DEBUG
+        normalized = np.zeros_like(filledMask)
+        debugMask = cv.normalize(filledMask, normalized, 0, 255, cv.NORM_MINMAX)
+        cv.imwrite("mask-without-floodfill.jpg", normalized)
+        # print(f"Before floodfill range: {normalized.min()} to {normalized.max()} Counts: {np.unique(normalized, return_counts=True)}")
+        # DEBUG
+        # At this point, the mask looks fine -- vegetation is white, ground is black
+        # TODO: The floodfill does bad things to the mask.
+        #cv.floodFill(filledMask, None, (0, 0), 255)
+        # DEBUG
+        # normalized = np.zeros_like(filledMask)
+        # debugMask = cv.normalize(filledMask, normalized, 0, 255, cv.NORM_MINMAX)
+        # cv.imwrite("mask-with-floodfill.jpg", normalized)
+        # print(f"After floodfill range: {normalized.min()} to {normalized.max()} Counts: {np.unique(normalized, return_counts=True)}")
+        # DEBUG
+
+        filledMaskInverted = cv.bitwise_not(filledMask)
+        filledMaskInverted = np.where(filledMaskInverted > 0, 1, filledMaskInverted)
+
+        self.mask = filledMaskInverted
+        finalMask = filledMaskInverted
+
+        negated = filledMaskInverted
+        #negated = np.logical_not(filledMaskInverted)
+        # End floodfill touch up
+
+        self.mask = negated
+
+        #DEBUG
+        # Ignore everything above and just set the mask to what we had before floodfill
+
+        self.mask = filledMask
+        return filledMask, thresholdUsed
+        #DEBUG
+
+        # FYI: the mask value returned here is not used
+        return finalMask, thresholdUsed
+    def MaskFromIndex(self, index: np.ndarray, negate: bool, direction: int, threshold: Union[float, str] = None) -> (np.ndarray, int):
+        """
+        Create a mask based on the index
+        :param index: The vegetation index
+        :param negate: If the mask should be negated
+        :param direction: 0 = up, 1= down
+        :param threshold:
+        The threshold value to use. If not specified, Otsu's Binarization is used.
+        :return:
+        (The mask as a numpy array with RGB channels, threshold)
+        """
+
+        # If a threshold is not supplied, use Otsu
+        if threshold == None or threshold == OTSU:
+            # Convert to a grayscale#
+            greyScale = index.astype(np.uint8)
+            # Original
+            #ret, thresholdedImage = cv.threshold(greyScale, 0, 255, cv.THRESH_BINARY+cv.THRESH_OTSU)
+            # Triangle
+            #self._threshold, thresholdedImage = cv.threshold(greyScale, 0, 255, cv.THRESH_BINARY+cv.THRESH_TRIANGLE)
+            self._threshold, thresholdedImage = cv.threshold(greyScale, 0, 255, cv.THRESH_BINARY+cv.THRESH_OTSU)
+            #th3 = cv.adaptiveThreshold(greyScale, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY, 11, 2)
+            thresholdUsed = self._threshold
+        elif threshold == TRIANGLE:
+            # Convert to a grayscale#
+            greyScale = index.astype(np.uint8)
+            blurred = cv.GaussianBlur(greyScale, (7, 7), 0)
+            self._threshold, thresholdedImage = cv.threshold(blurred, 0, 255, cv.THRESH_BINARY+cv.THRESH_TRIANGLE)
+            thresholdUsed = self._threshold
+        else:
+            thresholdUsed = threshold
+
+        # If the direction is 1, interpret the two thresholds as up, down
+        # To make this go back to the original implementation, set the second threshold to -9999
+
+        if direction > 0:
+            thresholdedIndex = index > thresholdUsed
+            finalMask = thresholdedIndex
+            negated = finalMask
+        else:
+            thresholdedIndex = index < thresholdUsed
+            #negated = np.logical_not(thresholdedIndex)
+            negated = thresholdedIndex
+            finalMask = negated
+
+        if negate:
+            finalMask = np.logical_not(thresholdedIndex)
+            #negated = finalMask
+
+        # Touch up the mask with some floodfill
+        filledMask = finalMask.copy().astype(np.uint8)
+        cv.floodFill(filledMask, None, (0, 0), 255)
+        filledMaskInverted = cv.bitwise_not(filledMask)
+        # finalMask = cv.bitwise_not(filledMaskInverted)
+        # #plt.imshow(finalMask, cmap='gray', vmin=0, vmax=1)
+        # #plt.show()
+        # As we apply this mask as multiplying, convert 255s to 1
+        filledMaskInverted = np.where(filledMaskInverted > 0, 1, filledMaskInverted)
+
+        self.mask = filledMaskInverted
+        finalMask = filledMaskInverted
+
+        negated = filledMaskInverted
+        #negated = np.logical_not(filledMaskInverted)
+        # End floodfill touch up
+
+        self.mask = negated
+
+
+        # FYI: the mask value returned here is not used
+        return finalMask, thresholdUsed
+
+    @property
+    def imageMask(self):
+        return self.mask
+
+    @imageMask.setter
+    def imageMask(self, theMask: np.ndarray):
+        self.mask = theMask
+
+
+    def applyMask(self):
+        # self.redBandMasked = self.redBand * self.mask # DataRED * negated
+        # self.greenBandMasked = self.greenBand * self.mask  # DataGREEN * negated
+        # self.blueBandMasked = self.blueBand * self.mask  # DataBLUE * negated
+
+        # Use the original bands, as the RGB bands may have been manipulated
+        self.redBandMasked = self.redBandOriginal * self.mask  # DataRED * negated
+        self.greenBandMasked = self.greenBandOriginal * self.mask  # DataGREEN * negated
+        self.blueBandMasked = self.blueBandOriginal * self.mask  # DataBLUE * negated
+
+        return
+
+    def GetMask(self):
+        return np.dstack([self.redBandMasked, self.greenBandMasked, self.blueBandMasked])
+
+    def ShowImage(self, title : str, index : np.ndarray):
+
+        plt.title(title)
+        #plt.imshow(index, cmap='gray', vmin=-1, vmax=1)
+        plt.imshow(index, cmap='gray')
+        plt.show()
+
+    def ExR(self) -> np.ndarray:
+        """
+        The Excessive Red Index
+        1.3*R - G
+        :return:
+        The index as a numpy array
+        """
+        excessRed = 1.3*self.redBand - self.greenBand
+        self._index = excessRed
+        self._name = "ExR"
+        return excessRed
+
+    def DI(self) -> np.ndarray:
+        """
+        Depth Index
+        :return: The index as a numpy array
+        """
+        assert self._depth is not None
+        minval = np.min(self._depth[np.nonzero(self._depth)])
+        maxval = np.max(self._depth[np.nonzero(self._depth)])
+        depthMean = np.average(self._depth)
+
+        self._depth[self._depth == 0] = depthMean
+        # Normalize the depth data in range 0..1
+        self._depth = 1 - self._depth
+        self._index = (self._depth - np.min(self._depth)) / (np.max(self._depth) - np.min(self._depth))
+
+        # Normalize the depth data between 0 and 255
+        # self._depth = 255 - self._depth
+        # normalizedData = np.zeros_like(self._depth, dtype="float64")
+        # np.copyto(normalizedData, self._depth)
+        # normalizedData *= (255.0 / self._depth.max())
+        # self._index = normalizedData
+        self._name = "DI"
+        return self._index
+
+    def refine(self) -> np.ndarray:
+        """
+        Refine the index
+        :return: the refined index
+        """
+        if self._depth is not None:
+            depthMean = np.average(self._depth)
+            self._depth[self._depth == 0] = depthMean
+            # Normalize the depth data in range 0..1
+            self._depth = 1 - self._depth
+            self._depth = (self._depth - np.min(self._depth)) / (np.max(self._depth) - np.min(self._depth))
+            self._index = np.multiply(self._depth, self._index)
+
+        self._index[self.index < 0] = 0
+        return self._index
+
+    def ExG(self) -> np.ndarray:
+        """
+        The Excessive Green Index
+        2*G - R - B
+        :return:
+        The index as a numpy array
+        """
+        # 2g-r-b
+
+        excessGreen = 2*self.greenBand - self.redBand - self.blueBand
+
+        self._index = excessGreen
+        self._name = "EXG"
+        return excessGreen
+
+    def ExGR(self) -> np.ndarray:
+        """
+        The Excess Green - Excessive Red Index
+        :return:
+        The index as a numpy array
+        """
+        exgr = np.empty_like(self.redBand)
+
+        exgr = self.ExG() - self.ExR()
+
+        self._index = exgr
+        self._name = "EXGR"
+        return exgr
+
+    def CIVE(self) -> np.ndarray:
+        """
+        The Color Index of Vegetation Extraction
+        :return:
+        The index as a numpy array
+        """
+        if self.gpuSupported:
+            print("Computing CIVE with GPU")
+            module = SourceModule("""
+                __global__ void cive(float *index, float *red, float *green, float *blue){
+                    int idx = blockIdx.x * blockDim.x * threadIdx.x;
+                    index[idx] = red[idx]*0.441 - 0.881*green[idx] + 0.385*blue[idx] + 18.78745;
+                }
+            """)
+            gpuIndex = cuda.mem_alloc(self.imgNP[:,:,self.CV_RED].nbytes)
+            function = module.get_function("cive")
+            function(gpuIndex, self.gpuRedBand, self.gpuGreenBand, self.gpuBlueBand, block=self.greenBand.shape, grid=(1,1,1))
+            cive = np.empty_like(self.greenBand)
+            cuda.memcpy_dtoh(cive, gpuIndex)
+        else:
+            cive = 0.441*self.redBand - 0.811*self.greenBand + 0.385*self.blueBand + 18.78745
+
+        self._name = "CIVE"
+        self._index = cive
+
+        return cive
+
+    def NGRDI(self) -> np.ndarray:
+        """
+        The Normalized Green-Red Difference Index
+        :return:
+        The index as a numpy array
+        """
+        ngrdi = np.zeros_like(self.img)
+        ngrdi_numerator = self.greenBand - self.redBand
+        ngrdi_denominator = self.greenBand + self.redBand
+
+        #ngrdi = (self.greenBand - self.redBand) / (self.greenBand + self.redBand)
+
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ngrdi =np.true_divide(ngrdi_numerator,ngrdi_denominator)
+            ngrdi[ngrdi == np.inf] = 0
+            ngrdi = np.nan_to_num(ngrdi)
+
+        self._name = "NGRDI"
+        self._index = ngrdi
+
+        return ngrdi
+
+    def VEG(self) -> np.ndarray:
+
+        #veg = self.greenBand / self.redBand ** 0.667 * self.blueBand ** (1-0.667)
+
+        veg_numerator = self.greenBand
+        veg_denominator = self.redBand ** 0.667 * self.blueBand ** (1-0.667)
+
+        with np.errstate(divide='ignore', invalid='ignore'):
+            veg =np.true_divide(veg_numerator,veg_denominator)
+            veg[veg == np.inf] = 0
+            veg = np.nan_to_num(veg)
+
+        self._index = veg
+        self._name = "VEG"
+        return veg
+
+    def COM1(self) -> np.ndarray:
+
+        com1 = self.ExG() + self.CIVE() + self.ExGR() + self.VEG()
+
+        self._index = com1
+        self._name = "COM1"
+        return com1
+
+    def MExG(self) -> np.ndarray:
+
+        mexg = 1.262 * self.greenBand - 0.884 * self.redBand - 0.311 * self.blueBand
+
+        self._index = mexg
+        self._name = "MEXG"
+        return mexg
+
+    def COM2(self) -> np.ndarray:
+
+        com2 = (0.36 * self.ExG()) + (0.47 * self.CIVE()) + (0.17 * self.VEG())
+
+        self._index = com2
+        self._name = "COM2"
+        return com2
+
+    def NDI(self) -> np.ndarray:
+
+        #img = self.images[0]
+
+
+        # Avoid conversion problems and set the dtype explicitly
+        # The problem here is that the bands are all 8 bit, so the intermediate values
+        # are incorrect when things exceed 8 bits.  As always, probably a more elegant way of doing things
+        # here
+        shape = self.redBand.shape
+
+        # NDI = np.empty(shape,dtype=np.int16)
+        # NDI_Numerator = np.empty(shape, dtype=np.int16)
+        # NDI_Denominator = np.empty(shape, dtype=np.int16)
+        # NDI = (self.greenBand.astype(dtype=np.int16)
+        #        - self.redBand.astype(dtype=np.int16)) \
+        #       / (self.greenBand.astype(dtype=np.int16)
+        #          + self.redBand.astype(dtype=np.int16))
+
+        NDI_Numerator=(self.greenBand.astype(dtype=np.int16)
+                       - self.redBand.astype(dtype=np.int16)) #DataGREEN-DataRED
+        NDI_Denominator=(self.greenBand.astype(dtype=np.int16)
+                         + self.redBand.astype(dtype=np.int16)) #DataGREEN+DataRED
+
+        with np.errstate(divide='ignore', invalid='ignore'):
+            NDI =np.true_divide(NDI_Numerator,NDI_Denominator) + 1
+            NDI= NDI * 128
+            NDI[NDI == np.inf] = 0
+            NDI = np.nan_to_num(NDI)
+
+        #MaskNDI = NDI > 0.100
+
+        # The mask we computed above is the opposite of what is needed
+        # We want the green bits to show through.
+        # TODO: Make this a 3d mask.  Seems like that should be possible
+        #negated = np.logical_not(MaskNDI)
+        #DataREDMasked = self.redBand * negated #DataRED * negated
+        #DataGREENMasked = self.greenBand * negated #DataGREEN * negated
+        #DataBLUEMasked = self.blueBand * negated #DataBLUE * negated
+
+        #RGBImage=vip.Image_getRGB(DataREDMasked,DataGREENMasked,DataBLUEMasked,8000)
+
+        self._index = NDI
+        self._name = "NDI"
+
+        return NDI
+        #result = cv.bitwise_and(RGBImage,MaskNDI)
+
+    def SI(self):
+        """
+        Blue spray indicator Index
+        :return:
+        """
+        # Convert the image to HSV
+        # manipulation = ImageManipulation(self.img, 0,)
+        # hsv = manipulation.toHSV()
+        hsv = cv.cvtColor(self.img.astype(np.uint8), cv.COLOR_BGR2HSV)
+
+        # Pure colors
+        # lower_blue = np.array([110, 90, 90])
+        # upper_blue = np.array([110, 255, 255])
+
+        green = np.uint8([[[0, 255, 0]]])
+        red = np.uint8([[[0, 0, 255]]])
+        blue = np.uint8([[[255, 0, 0]]])
+
+
+        # Get the HSV for the color green
+        hsv_blue = cv.cvtColor(blue, cv.COLOR_BGR2HSV)
+        # Compute the lower and upper bound of what we consider green
+        lowerBlue = np.array([int(hsv_blue[0, 0, 0]) - self.HSV_COLOR_THRESHOLD, 130, 130])
+        upperBlue = np.array([int(hsv_blue[0, 0, 0]) + self.HSV_COLOR_THRESHOLD, 255, 255])
+
+
+        maskGreen = cv.inRange(hsv, lowerBlue, upperBlue)
+        #maskRed = cv.inRange(hsv, lowerRed, upperRed)
+
+
+        mask = maskGreen
+
+        # Bitwise-AND mask and original image
+        #res = cv.bitwise_and(self.img,self.img, mask= mask)
+        return mask
+
+    # https://github.com/mcelrjo/pygreenturf/blob/master/pyGreenTurf_0.2.5.py
+
+    # This is a very slow routine -- this should be farmed out to the GPU
+    def DGCI(self) -> np.ndarray:
+        """
+        Compute the Dark Green Color Index.
+        This is not particularly useful as an index for mask creation/segmentation, but the values here to indicate
+        chlorophyll levels may be useful.
+        :return:
+        """
+        sat = []
+        val = []
+
+        assert(self._imageFromPil is not None)
+
+        imgArray = np.array(self._imageFromPil)
+        dgci = np.zeros_like(self.img[:, :, 0], dtype=float)
+        height, width, channels = np.shape(self.img)
+
+        hueAngles = []
+        for x in range(height):
+            for y in range(width):
+                # print j[0], j[1], j[2]
+
+                h, s, v = colorsys.rgb_to_hsv(imgArray[x, y, 0] / 255., imgArray[x, y, 1] / 255., imgArray[x, y, 2] / 255.)
+                #h, s, v = colorsys.rgb_to_hsv(float(j[0]) / 255., float(j[1]) / 255., float(j[2]) / 255.)
+                hue = h * 360
+                hueAngles.append(hue)
+                sat.append(s)
+                val.append(v)
+                dgciAtPoint = ((((hue - 60.0) / 60.0) + (1.0 - s) + (1.0 - v)) / 3.0)
+                dgci[x][y] = dgciAtPoint
+
+        return dgci
+
+    def _DGCI(self) -> np.ndarray:
+
+        height, width, channels = np.shape(self.img)
+        # Confirm this is a color image
+        assert channels == 3
+
+        img = self.img
+        dgci = np.zeros_like(img[:, :, 0], dtype=float)
+
+        imgAsHLS = cv.cvtColor(self.img.astype(np.uint8), cv.COLOR_BGR2HSV)
+
+        for x in range(height):
+            for y in range(width):
+                hue = imgAsHLS[x, y, 0]
+                saturation = imgAsHLS[x, y, 1]
+                luminance = imgAsHLS[x, y, 2]
+                dgciAtPoint = (((hue - 60) / 60) + (1 - saturation) + (1 - luminance)) / 3
+                #print(f"HLS ({hue},{saturation},{luminance}) DGCI {dgciAtPoint}")
+
+                dgci[x][y] = dgciAtPoint
+        return dgci
+
+    def _old_DGCI(self) -> np.ndarray:
+        """
+        Compute the Dark Green Color Index (DGCI)
+        :return:
+        """
+        # Formula from this article
+        # https://www.petiolepro.com/blog/dark-green-colour-index-dgci-a-new-measurement-of-chlorophyll/
+        # DGCI = {(hue − 60)/60 + (1 − saturation) + (1 − brightness)}/3
+        img = self.img
+        height, width, channels = np.shape(self.img)
+
+        # Confirm this is a color image
+        assert channels == 3
+
+        # Use this as guidance
+        # https://acsess-onlinelibrary-wiley-com.ezproxy4.library.arizona.edu/doi/10.2135/cropsci2003.9430
+        # Normalize values in range (0..1)
+        bgrNormalized = self.img.astype(np.uint8) / 255
+
+        dgci = np.zeros_like(img[:, :, 0])
+
+        for x in range(height):
+            for y in range(width):
+                b, g, r = bgrNormalized[x, y]
+                maximum = max(r, g, b)
+                minimum = min(r, g, b)
+
+                # H U E
+                # There seem to be 3 different formulae depending on which channel is max
+
+                # Avoid division by zero
+                maximum += 0.00001
+
+                if maximum != minimum:
+                    # Red is max
+                    if max(b, g, r) == r:
+                        h = 60 * ((g - b) / (maximum - minimum))
+                    # Green is max
+                    elif max(b, g, r) == g:
+                        h = 60 * (2.0 + (b - r) * (maximum - minimum))
+                    # Blue is max
+                    elif max(b, g, r) == b:
+                        h = 60 * (4.0 + (r - g) * (maximum - minimum))
+                    else:
+                        assert False
+                else:
+                    h = 0
+
+                # L I G H T N E S S
+                lightness = maximum
+
+                # S A T U R A T I O N
+                saturation = (maximum - minimum) / maximum
+
+                dgciAtPoint = ((h - 60) / 60 + (1 - saturation) + (1 - lightness)) / 3
+
+                dgci[x][y] = dgciAtPoint
+        print("DGCI Calculated")
+        return dgci
+
+
+
+
+
+    #
+    # Not really an index for things found in nature, but intended for the colored dots
+    # technique where green is for crop and red is for weeds.
+    #
+    def redGreenDots(self):
+        # Convert the image to HSV
+        # manipulation = ImageManipulation(self.img, 0,)
+        # hsv = manipulation.toHSV()
+        hsv = cv.cvtColor(self.img.astype(np.uint8), cv.COLOR_BGR2HSV)
+
+        # Pure colors
+        green = np.uint8([[[0,255,0 ]]])
+        red = np.uint8([[[0,0,255]]])
+
+        # Get the HSV for the color green
+        hsv_green = cv.cvtColor(green,cv.COLOR_BGR2HSV)
+        # Compute the lower and upper bound of what we consider green
+        lowerGreen = np.array([int(hsv_green[0,0,0]) - self.HSV_COLOR_THRESHOLD,100,100])
+        upperGreen = np.array([int(hsv_green[0,0,0]) + self.HSV_COLOR_THRESHOLD, 255,255])
+
+        hsv_red = cv.cvtColor(red,cv.COLOR_BGR2HSV)
+        # Compute the lower and upper bound of what we consider green
+        lowerRed = np.array([int(hsv_red[0,0,0]) - 5,100,100])
+        upperRed = np.array([int(hsv_red[0,0,0]) + 5, 255,255])
+        # lower boundary RED color range values; Hue (0 - 10)
+
+        # Another red attempt
+        # This looks odd, but eliminates the hue of red in the floor
+        lower1 = np.array([0, 100, 20])
+        #upper1 = np.array([10, 255, 255])
+        upper1 = np.array([0, 255, 255])
+
+        # upper boundary RED color range values; Hue (160 - 180)
+        lower2 = np.array([160,100,20])
+        upper2 = np.array([179,255,255])
+
+        lower_mask = cv.inRange(hsv, lower1, upper1)
+        upper_mask = cv.inRange(hsv, lower2, upper2)
+
+        maskRed = lower_mask + upper_mask
+
+        #result = cv2.bitwise_and(result, result, mask=full_mask)
+
+
+
+
+        maskGreen = cv.inRange(hsv, lowerGreen, upperGreen)
+        #maskRed = cv.inRange(hsv, lowerRed, upperRed)
+
+        # The final mask where either of the two colors are present
+        mask = cv.bitwise_or(maskGreen, maskRed)
+
+        # Crap, this does not work well on the test data -- the floor has too much red in it.
+        # So the results have way too much in them to be useful.
+        # I'll try this with blue, but in the meantime, just use the green mask
+        #mask = maskGreen
+
+        # Bitwise-AND mask and original image
+        #res = cv.bitwise_and(self.img,self.img, mask= mask)
+        return mask
+
+    # Color values taken from:
+    # https://stackoverflow.com/questions/36817133/identifying-the-range-of-a-color-in-hsv-using-opencv
+    colorHSV = {'black': [[180, 255, 30], [0, 0, 0]],
+                'white': [[180, 18, 255], [0, 0, 231]],
+                'red1': [[180, 255, 255], [159, 50, 70]],
+                'red2': [[9, 255, 255], [0, 50, 70]],
+                'green': [[89, 255, 255], [36, 50, 70]],
+                # The bucket lid index is interested in isolating something that is pretty solid blue, so bump up
+                # the saturation a bit -- this was 50 earlier
+                'blue': [[128, 255, 255], [90, 90, 70]],
+                'yellow': [[35, 255, 255], [25, 50, 70]],
+                'purple': [[158, 255, 255], [129, 50, 70]],
+                'orange': [[24, 255, 255], [10, 50, 70]],
+                'gray': [[180, 18, 230], [0, 0, 40]]}
+
+    #
+    # This index is specifically for the blue bucket lids from lowes
+    #
+    def bucketLid(self):
+        # Convert the image to HSV
+        hsv = cv.cvtColor(self.img.astype(np.uint8), cv.COLOR_BGR2HSV)
+
+        # Pure colors
+        blue = np.uint8([[[255, 0, 0]]])
+
+        # Get the HSV for the color green
+        hsv_blue = cv.cvtColor(blue, cv.COLOR_BGR2HSV)
+        # Compute the lower and upper bound of what we consider blue
+        lowerBlue = np.array(self.colorHSV['blue'][1])
+        upperBlue = np.array(self.colorHSV['blue'][0])
+        lowerBlueOriginal = np.array([int(hsv_blue[0, 0, 0]) - self.HSV_COLOR_THRESHOLD, 100, 100])
+        upperBlueOriginal = np.array([int(hsv_blue[0, 0, 0]) + self.HSV_COLOR_THRESHOLD, 255, 255])
+
+        # Another red attempt
+        # This looks odd, but eliminates the hue of red in the floor
+        lower1 = np.array([0, 100, 20])
+        #upper1 = np.array([10, 255, 255])
+        upper1 = np.array([0, 255, 255])
+
+        # upper boundary RED color range values; Hue (160 - 180)
+        lower2 = np.array([160,100,20])
+        upper2 = np.array([179,255,255])
+
+        maskBlue = cv.inRange(hsv, lowerBlue, upperBlue)
+
+        return maskBlue
+
+    #
+    # This index is specifically for segmenting out irrigation equipment
+    #
+    def pipes(self):
+        manipulatedImage = ImageManipulation(self.img, 0, None)
+        img = manipulatedImage.toYCBCR()
+        #img[:, :, 0] = cv.equalizeHist(img[:, :, 0])
+        self.yBand = img[:, :, 0]
+        self.cbBand = img[:, :, 1]
+        self.crBand = img[:, :, 2]
+
+        lessThan = self.cbBand <= self.crBand
+        # greaterThan = self.cbBand >= self.crBand
+        # delta = np.absolute(self.cbBand - self.crBand)
+        return lessThan
+
+        # Convert the image to YCBCR
+        ycbcr = cv.cvtColor(self.img.astype(np.uint8), cv.COLOR_BGR2YCR_CB)
+        maskYCBCR = np.where(ycbcr[1] < ycbcr[2], 0, 1)
+
+        return maskYCBCR
+
+    def EI(self) -> np.ndarray:
+        """
+        Compute the segmentation based on edge detection.
+        This was an idea that didn't work out as I had hoped. Ignore for now.
+        :return:
+        """
+        assert False
+
+        imageAsGreyscale = cv.imread(self._imageLocation, cv.IMREAD_GRAYSCALE)
+        blur = cv.GaussianBlur(imageAsGreyscale, (7, 7), 0)
+        #thresh = cv.adaptiveThreshold(blur, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 13, 2)
+        edges = cv.Canny(blur, 150, 300, 9)
+        cv.imwrite("edges.jpg", edges)
+
+        return edges
+
+    def YI(self) -> np.ndarray:
+        """
+        YIQ Based Index
+        :return: Index
+        """
+        # Convert image to YIQ.
+        yiq = rgb2yiq(self.img)
+        self.imgNP: np.ndarray
+        # These bands are floating point with negative values, so this doesn't apply
+        #self.imgNP = np.array(yiq).astype(dtype=np.int16)
+        self.imgNP = yiq
+        self.yBand = self.imgNP[:, :, 0]
+        self.iBand = self.imgNP[:, :, 1]
+        self.qBand = self.imgNP[:, :, 2]
+        differences = np.absolute(self.imgNP[:, :, 2]) - np.absolute(self.imgNP[:, :, 1])
+        #yiqIndex = 1.262 * self.greenBand - 0.884 * self.redBand - 0.311 * self.blueBand
+        #yiqIndex = 0.0 * self.yBand + 2 * differences * self.iBand + 2 * differences * self.qBand
+        yiqIndex = np.where(self.qBand < 0.04, self.qBand, 0)
+        #print(f"Range of data: {np.min(yiqIndex)} to {np.max(yiqIndex)}")
+
+        self._index = yiqIndex
+        self._name = "YI"
+
+        return yiqIndex
+
+    def HI(self) -> np.ndarray:
+        """
+        HSI Based index
+        :return: Index
+        """
+        manipulatedImage = ImageManipulation(self.img, 0, None)
+        img = manipulatedImage.toHSI()
+        #img = cv.cvtColor(self.img.astype(np.uint8), cv.COLOR_BGR2HSV)
+        self.hBand = img[:, :, 0]
+        self.sBand = img[:, :, 1]
+        self.iBand = img[:, :, 2]
+
+        self.hBand[(self.hBand >= 190)] = 0
+        self.hBand[(self.hBand <= 55)] = 0
+        self.sBand[(self.sBand <= 0.45)] = 0
+        self.iBand[(self.iBand >= 50)] = 0
+
+        hsiIndex = 1 * self.hBand + 1 * self.sBand + 1 * self.iBand
+        self._index = hsiIndex
+        self._name = "HSI"
+
+        return hsiIndex
+
+    def HV(self) -> np.ndarray:
+        """
+        HSV Based index
+        :return: Index
+        """
+        manipulatedImage = ImageManipulation(self.img, 0, None)
+        img = manipulatedImage.toHSV()
+        #img = cv.cvtColor(self.img.astype(np.uint8), cv.COLOR_BGR2HSV)
+        img[:, :, 2] = cv.equalizeHist(img[:, :, 2])
+        self.hBand = img[:, :, 0]
+        self.sBand = img[:, :, 1]
+        self.vBand = img[:, :, 2]
+
+        self.hBand[(self.hBand >= 50)] = 0
+        self.hBand[(self.hBand <= 30)] = 0
+        #self.sBand[(self.sBand >= 65)] = 0
+        self.sBand[(self.sBand <= 20)] = 0
+        #self.vBand[(self.vBand >= 0)] = 0
+
+        # Normalize the S band
+        scaler = MinMaxScaler(feature_range=(0.0, 1))
+        bandDF = pd.DataFrame(self.sBand)
+        self.sBand = scaler.fit_transform(bandDF)
+
+        # Normalize the V band
+        scaler = MinMaxScaler(feature_range=(0.0, 1))
+        bandDF = pd.DataFrame(self.vBand)
+        self.vBand = scaler.fit_transform(bandDF)
+
+        # print(f"Sband range: {self.sBand.min()} to {self.sBand.max()}")
+        # print(f"Vband range: {self.vBand.min()} to {self.vBand.max()}")
+
+        #hsvIndex = 1 * self.hBand + 1 * self.sBand + 1 * self.vBand
+        hsvIndex = self.hBand * self.vBand
+        self._index = hsvIndex
+        self._name = "HSV"
+
+        return hsvIndex
+
+    def CI(self) -> np.ndarray:
+        """
+        CIELab based index
+        :return: index
+        """
+        manipulatedImage = ImageManipulation(self.img, 0, None)
+        img = manipulatedImage.toCIELAB()
+        #img[:, :, 2] = cv.equalizeHist(img[:, :, 2])
+        self.lBand = img[:, :, 0]
+        self.aBand = img[:, :, 1]
+        self.bBand = img[:, :, 2]
+
+        difference = self.bBand.astype(np.float64) - self.aBand.astype(np.float64)
+        difference[difference < 30] = 0
+        #print(f"Difference range: {np.min(difference)} to {np.max(difference)}")
+
+        self.aBand[(self.aBand >= 125)] = 0
+        self.aBand[(self.aBand <= 105)] = 0
+        # self.bBand[(self.bBand >= 65)] = 0
+        # self.bBand[(self.bBand <= 20)] = 0
+        self.lBand[(self.lBand >= 0)] = 0
+
+        # # Normalize the S band
+        # scaler = MinMaxScaler(feature_range=(0.0, 1))
+        # bandDF = pd.DataFrame(self.sBand)
+        # self.sBand = scaler.fit_transform(bandDF)
+        #
+        # # Normalize the V band
+        # scaler = MinMaxScaler(feature_range=(0.0, 1))
+        # bandDF = pd.DataFrame(self.vBand)
+        # self.vBand = scaler.fit_transform(bandDF)
+
+        # print(f"Sband range: {self.sBand.min()} to {self.sBand.max()}")
+        # print(f"Vband range: {self.vBand.min()} to {self.vBand.max()}")
+
+        #hsvIndex = 1 * self.hBand + 1 * self.sBand + 1 * self.vBand
+        ciIndex = difference
+        self._index = ciIndex
+        self._name = "CI"
+
+        return ciIndex
+
+    def YCbCrI(self) -> np.ndarray:
+        """
+        YCbCr based index
+        :return: index
+        """
+        manipulatedImage = ImageManipulation(self.img, 0, None)
+        img = manipulatedImage.toYCBCR()
+        img[:, :, 0] = cv.equalizeHist(img[:, :, 0])
+        self.yBand = img[:, :, 0]
+        self.cbBand = img[:, :, 1]
+        self.crBand = img[:, :, 2]
+
+        # lessThan = self.cbBand <= self.crBand
+        # greaterThan = self.cbBand >= self.crBand
+        # delta = np.absolute(self.cbBand - self.crBand)
+
+        with np.errstate(divide='ignore'):
+            #self.crBand = np.log2(np.absolute(self.crBand.astype(np.float64) - self.cbBand.astype(np.float64))) * self.crBand
+            #self.crBand = np.sqrt(np.absolute(self.cbBand.astype(np.float64))) * self.crBand
+            self.crBand = np.log2(abs(self.crBand)) * self.cbBand
+        # differences[differences >= 20] = 0
+        # differences[differences <= 10] = 0
+
+        self.crBand[(self.crBand >= 890)] = 0
+
+
+        #hsvIndex = 1 * self.hBand + 1 * self.sBand + 1 * self.vBand
+        yCbCrIndex = self.crBand
+        self._index = yCbCrIndex
+        self._name = "YCbCrI"
+
+        return yCbCrIndex
+
+    def repair(self):
+        """
+        Repair the masked image using the original image as a guide.\n
+        If all the neighbors of a pixel that is masked out are similar to each other, the pixel is probably not masked correctly
+        If this is the case, use the original value to fill in the hole.
+        """
+        masked = self.GetImage()
+        original = self.img
+
+        rows, columns = masked.shape
+        for row in range(rows):
+            for column in range(columns):
+                # If the RGB values are all 0s, this pixel is a candidate for repair
+                if masked[row, column, 0] == 0 and masked[row, column, 1] == 0 and masked[row, column, 2] == 0:
+                    # Determine how many neighboring pixels are similar to each other in the original image
+                    # Similar means 'close to the average' for that matrix
+                    pass
+
+
+    def plot(self, planeLocation: int):
+        # I can get plotly to work only with square arrays, not rectangular, so just take a subset
+        height, width = self._index.shape
+        subsetLength = min(height, width)
+        offset = 0
+        if subsetLength > 2100:
+            subsetLength = 2100
+        subset = self._index[0:subsetLength, offset:offset + subsetLength]
+        xi = np.linspace(0, subset.shape[0], num=subset.shape[0])
+        yi = np.linspace(0, subset.shape[1], num=subset.shape[1])
+
+        fig = go.Figure(data=[go.Surface(x=xi, y=yi, z=subset)])
+
+        print(f"Index range: {self._index.min()} to {self._index.max()}")
+        # The plane represents the threshold value
+        if planeLocation < np.max(self._index) and planeLocation > np.min(self._index):
+            x1 = np.linspace(0, subsetLength, subsetLength)
+            y1 = np.linspace(0, subsetLength, subsetLength)
+            z1 = np.ones(subsetLength) * planeLocation
+            plane = go.Surface(x=x1, y=y1, z=np.array([z1] * len(x1)).T, opacity=0.5, showscale=False, showlegend=False)
+
+            fig.add_traces([plane])
+        else:
+            print("Threshold location is not within range of data")
+
+
+        # Can't get these to work
+        # fig = go.Figure(data=[go.Mesh3d(x=xi, y=yi, z=subset, color='lightpink', opacity=0.50)])
+        # fig = go.Figure(data=go.Isosurface(x=xi, y=yi,z=subset, isomin=-1, isomax=1))
+
+        fig.update_layout(title=self._name, autosize=False,
+                          width=1000, height=1000,
+                          margin=dict(l=65, r=50, b=65, t=90))
+
+        fig.show()
+
+    # Create and initialize an index
+    def setup(self, technique: str, threshold : str):
+        #index = VegetationIndex()
+        indices = {ALG_NDI: {"short": "NDI", "create": self.NDI, "negate": False, "threshold": thresholds["NDI"], "direction": 1, "normalize": False},
+                   ALG_EXG: {"short": "ExG", "create": self.ExG, "negate": True, "threshold": thresholds["EXG"], "direction": -1, "normalize": True},
+                   ALG_EXR: {"short": "ExR", "create": self.ExR, "negate": False, "threshold": thresholds["EXR"], "direction": -1, "normalize": True},
+                   ALG_CIVE: {"short": "CIVE", "create": self.CIVE, "negate": True, "threshold": thresholds["CIVE"], "direction": 1, "normalize": True},
+                   ALG_EXGEXR: {"short": "ExGR", "create": self.ExGR, "negate": False, "threshold": thresholds["EXGEXR"], "direction": 1, "normalize": True},
+                   ALG_NGRDI: {"short": "NGRDI", "create": self.NGRDI, "negate": False, "threshold": thresholds["NGRDI"], "direction": 1, "normalize": False},
+                   ALG_VEG: {"short": "VEG", "create": self.VEG, "negate": False, "threshold": thresholds["VEG"], "direction": 1, "normalize": True},
+                   ALG_COM1: {"short": "COM1", "create": self.COM1, "negate": False, "threshold": thresholds["COM1"], "direction": 1, "normalize": False} ,
+                   ALG_MEXG: {"short": "MexG", "create": self.MExG, "negate": False, "threshold": thresholds["MEXG"], "direction": 1, "normalize": True},
+                   ALG_COM2: {"short": "COM2", "create": self.COM2, "negate": False, "threshold": thresholds["COM2"], "direction": 1, "normalize": False},
+                   ALG_TGI: {"short": "TGI", "create": self.TGI, "negate": False, "threshold": thresholds["TGI"], "direction": 1, "normalize": True},
+                   #"Depth Index": {"short": "DI", "create": self.DI, "negate": False, "threshold": thresholds["TGI"], "direction": 1, "normalize": True},
+                   #"Dark Green Color Index": {"short": "DGCI", "create": self.DGCI, "negate": False, "threshold": thresholds["DGCI"], "direction": 1, "normalize": True},
+                   #"Edge Index": {"short": "EI", "create": self.EI, "negate": False, "threshold": thresholds["EI"], "direction": 1, "normalize": True},
+                   "YIQ Index": {"short": "YI", "create": self.YI, "negate": True, "threshold": thresholds["YI"], "direction": 1, "normalize": False},
+                   ALG_HI: {"short": "HI", "create": self.HI, "negate": False, "threshold": thresholds["HI"], "direction": 1, "normalize": True},
+                   ALG_HV: {"short": "HV", "create": self.HV, "negate": False, "threshold": thresholds["HV"], "direction": 1, "normalize": True},
+                   ALG_CI: {"short": "CI", "create": self.CI, "negate": False, "threshold": thresholds["HV"], "direction": 1, "normalize": True},
+                   ALG_YCBCRI: {"short": "YCbCrI", "create": self.YCbCrI, "negate": False, "threshold": thresholds["YCBCR"], "direction": 1, "normalize": True}}
+        indices[technique]["create"]()
+        indexAsArray = self.refine()
+        if threshold is not None:
+            try:
+                thresholdForMask = float(threshold)
+            except ValueError:
+                # Must be OTSU or TRIANGLE
+                if threshold in VegetationIndex.thresholdChoices:
+                    thresholdForMask = threshold
+                else:
+                    print(f"Threshold must be one of {VegetationIndex.thresholdChoices} or a valid float")
+                    sys.exit(-1)
+        else:
+            thresholdForMask = None
+        mask, threshold = self.createMask(indexAsArray, indices[technique]["negate"], indices[technique]["direction"], thresholdForMask)
+        return
+
+if __name__ == "__main__":
+    from Performance import Performance
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import sys
+    import glob
+    from pathlib import Path
+    from tqdm import tqdm
+
+    import constants
+
+    utility = VegetationIndex()
+    indexChoices = []
+    indexChoices = utility.GetSupportedAlgorithms()
+    indexChoices.append("all")
+    parser = argparse.ArgumentParser("Show various vegetation indices")
+
+    parser.add_argument('-e', '--encoding', action="store", required=False, default="jpg", choices=["jpg", "png"], help="Image encoding for output")
+    parser.add_argument('-i', '--input', action="store", required=True, type=str, help="Image or directory to process")
+    parser.add_argument('-o', '--output', action="store", required=True,  help="Output directory for processed images")
+    parser.add_argument('-m', '--masks', action="store", required=True,  help="Output directory for masks")
+    parser.add_argument('-nm', '--no-mask', action="store_true", required=False, default=False, help="Don't output mask")
+    parser.add_argument('-n', '--name', action="store", choices=indexChoices, nargs='*', required=False, help="Index name or all")
+    parser.add_argument('-p', '--plot', action="store_true", default=False, help="Plot the index")
+    parser.add_argument('-r', '--refine', action="store_true", default=False, help="Refine the mask before application")
+    parser.add_argument('-s', '--show', action="store_true", default=False, help="Show intermediate images")
+    parser.add_argument('-t', '--threshold', action="store", required=False, help="Calculate thresholds")
+    parser.add_argument('-c', '--csv', action="store", required=False, default="performance.csv", help="Performance CSV")
+
+    arguments = parser.parse_args()
+
+
+    # If a directory is specified, find all the images
+    if os.path.isdir(arguments.input):
+        pattern = arguments.input + "/*" + constants.EXTENSION_IMAGE
+        files = glob.glob(pattern)
+    else:
+        files = [arguments.input]
+
+    performance = Performance(arguments.csv)
+    (performanceOK, performanceDiagnostics) = performance.initialize()
+    if not performanceOK:
+        print(performanceDiagnostics)
+        sys.exit(1)
+
+
+    # The thresholds are probably dependant on the image selected, so
+    # we can't use fixed values in practice.
+    # For the overhead:
+    threshOasis = {"NDI"   : 0,
+                   "EXG"   : 200,
+                   "EXR"   : 75,
+                   "CIVE"  : 20,
+                   "EXGEXR": 100,
+                   "NGRDI" : 200,
+                   "VEG"   : 0,
+                   "COM1"  : 400,
+                   "MEXG"  : 0,
+                   "COM2"  : 80,
+                   "TGI"   : 0}
+
+    # Original thresholds
+    threshOverhead = {"NDI"   : 130,
+                      "EXG"   : 0.05,
+                      "EXR"   : 0.035,
+                      "CIVE"  : 18.76,
+                      "EXGEXR": 0,
+                      "NGRDI" : 0,
+                      "VEG"   : 1.09,
+                      "COM1"  : 20,
+                      "MEXG"  : 0.08,
+                      "COM2"  : 9.03,
+                      "TGI"   : 0,
+                      "DI"    : 0,
+                      #"DGCI"  : 0,
+                      'EI'    : 0,
+                      'YI'    : -0.01,
+                      'HI'    : 50,
+                      'HV'    : 0.01,
+                      "YCBCR" : 200}
+
+    # Thresholds for Haiquan's images
+    threshOverhead = {"NDI"   : 125,
+                      "EXG"   : 0.10,
+                      "EXR"   : 0.04,
+                      "CIVE"  : 18.74,
+                      "EXGEXR": 0.05,
+                      "NGRDI" : 0.0,
+                      "VEG"   : 1.15,
+                      "COM1"  : 50,
+                      "MEXG"  : 0.100,
+                      "COM2"  : 20.0,
+                      "TGI"   : 0.019,
+                      "DI"    : 0,
+                      #"DGCI"  : 0,
+                      'EI'    : 0,
+                      'YI'    : -0.03,
+                      'HI'    : 50,
+                      'HV'    : 0.01,
+                      "YCBCR" : 200}
+    # Thresholds where we need two sides (like red stems we want to pick up)
+    # threshOverhead = {"NDI"   : (130,0),
+    #                   "EXG"   : (50,0),
+    #                   "EXR"   : (20,0),
+    #                   "CIVE"  : (40,5),
+    #                   "EXGEXR": (50,-9999),
+    #                   "NGRDI" : (0,-9999),
+    #                   "VEG"   : (2,-9999),
+    #                   "COM1"  : (5,-9999), # Originally 25
+    #                   "MEXG"  : (30,-9999), # Originally 40
+    #                   "COM2"  : (15,-9999),
+    #                   "TGI"   : (20,-9999),
+    #                   "DI"    : (440,0),
+    #                   "DGCI"  : (440,0),
+    #                   "EI"    : (0, 0)}
+    threholds = threshOverhead
+
+    # All of the indices
+    indices = {"Normalized Difference": {"short": "NDI", "create": utility.NDI, "negate": False, "threshold": threholds["NDI"], "direction": 1, "normalize": False},
+               "Excess Green": {"short": "ExG", "create": utility.ExG, "negate": True, "threshold": threholds["EXG"], "direction": -1, "normalize": True},
+               "Excess Red": {"short": "ExR", "create": utility.ExR, "negate": False, "threshold": threholds["EXR"], "direction": -1, "normalize": True},
+               "Color Index of Vegetation Extraction": {"short": "CIVE", "create": utility.CIVE, "negate": True, "threshold": threholds["CIVE"], "direction": 1, "normalize": True},
+               "Excess Green - Excess Red": {"short": "ExGR", "create": utility.ExGR, "negate": False, "threshold": threholds["EXGEXR"], "direction": 1, "normalize": True},
+               "Normalized Green Red Difference": {"short": "NGRDI", "create": utility.NGRDI, "negate": False, "threshold": threholds["NGRDI"], "direction": 1, "normalize": False},
+               "Vegetative Index": {"short": "VEG", "create": utility.VEG, "negate": False, "threshold": threholds["VEG"], "direction": 1, "normalize": True},
+               "Combined Index 1": {"short": "COM1", "create": utility.COM1, "negate": False, "threshold": threholds["COM1"], "direction": 1, "normalize": False} ,
+               "Modified Excess Green": {"short": "MexG", "create": utility.MExG, "negate": False, "threshold": threholds["MEXG"], "direction": 1, "normalize": True},
+               "Combined Index 2": {"short": "COM2", "create": utility.COM2, "negate": False, "threshold": threholds["COM2"], "direction": 1, "normalize": False},
+               "Triangulation Greenness Index": {"short": "TGI", "create": utility.TGI, "negate": False, "threshold": threholds["TGI"], "direction": 1, "normalize": True},
+               #"Depth Index": {"short": "DI", "create": utility.DI, "negate": False, "threshold": threholds["TGI"], "direction": 1, "normalize": True},
+               #"Dark Green Color Index": {"short": "DGCI", "create": utility.DGCI, "negate": False, "threshold": threholds["DGCI"], "direction": 1, "normalize": True},
+               #"Edge Index": {"short": "EI", "create": utility.EI, "negate": False, "threshold": threholds["EI"], "direction": 1, "normalize": True},
+               "YIQ Index": {"short": "YI", "create": utility.YI, "negate": True, "threshold": threholds["YI"], "direction": 1, "normalize": False},
+               "HSI Index": {"short": "HI", "create": utility.HI, "negate": False, "threshold": threholds["HI"], "direction": 1, "normalize": True},
+               "HSV Index": {"short": "HV", "create": utility.HV, "negate": False, "threshold": threholds["HV"], "direction": 1, "normalize": True},
+               "CIELAB Index": {"short": "CI", "create": utility.CI, "negate": False, "threshold": threholds["HV"], "direction": 1, "normalize": True},
+               "YCBCR Index": {"short": "YCbCrI", "create": utility.YCbCrI, "negate": False, "threshold": threholds["YCBCR"], "direction": 1, "normalize": True}}
+
+    # Debug the implementations:
+    _indices = {
+        #"Excess Green - Excess Red": {"short": "ExGR", "create": utility.ExGR, "negate": False, "threshold": threholds["EXGEXR"], "direction": 1, "normalize": True},
+        #"YIQ Index": {"short": "YI", "create": utility.YI, "negate": True, "threshold": threholds["YI"], "direction": 1, "normalize": False},
+        #"Vegetative Index": {"short": "VEG", "create": utility.VEG, "negate": False, "threshold": threholds["VEG"], "direction": 1, "normalize": True},
+        #"Normalized Green Red Difference": {"short": "NGRDI", "create": utility.NGRDI, "negate": False, "threshold": threholds["NGRDI"], "direction": 1, "normalize": False},
+        #"Normalized Difference": {"short": "NDI", "create": utility.NDI, "negate": False, "threshold": threholds["NDI"], "direction": 1, "normalize": False}
+        #"Modified Excess Green": {"short": "MexG", "create": utility.MExG, "negate": False, "threshold": threholds["MEXG"], "direction": 1, "normalize": True},
+        #"HSV Index": {"short": "HV", "create": utility.HV, "negate": False, "threshold": threholds["HV"], "direction": 1, "normalize": False},
+        #"Excess Red": {"short": "ExR", "create": utility.ExR, "negate": False, "threshold": threholds["EXR"], "direction": -1, "normalize": True},
+        #"Excess Green": {"short": "ExG", "create": utility.ExG, "negate": True, "threshold": threholds["EXG"], "direction": -1, "normalize": True}
+        #"Combined Index 1": {"short": "COM1", "create": utility.COM1, "negate": False, "threshold": threholds["COM1"], "direction": 1, "normalize": False},
+        #"Combined Index 2": {"short": "COM2", "create": utility.COM2, "negate": False, "threshold": threholds["COM2"], "direction": 1, "normalize": False},
+        #"Color Index of Vegetation Extraction": {"short": "CIVE", "create": utility.CIVE, "negate": True, "threshold": threholds["CIVE"], "direction": 1, "normalize": True},
+        #"CIELAB Index": {"short": "CI", "create": utility.CI, "negate": False, "threshold": threholds["HV"], "direction": 1, "normalize": True}
+        #"YCBCR Index": {"short": "YCbCrI", "create": utility.YCbCrI, "negate": False, "threshold": threholds["YCBCR"], "direction": 1, "normalize": True}
+        #"Triangulation Greenness Index": {"short": "TGI", "create": utility.TGI, "negate": False, "threshold": threholds["TGI"], "direction": 1, "normalize": True},
+        #"Bucket Lid": {"short": "BLI", "create": utility.bucketLid, "negate": False, "threshold": threholds["TGI"], "direction": 1, "normalize": False},
+        "Pipes": {"short": "PIPE", "create": utility.pipes, "negate": False, "threshold": threholds["TGI"], "direction": 1, "normalize": False},
+    }
+
+
+    thresholdTechniques = ["OTSU", "TRIANGLE"]
+
+    for n in tqdm(range(len(files))):
+        file = files[n]
+        # Step through the indices and show the result on the target image
+        for indexName, indexData in indices.items():
+
+            # If the user specified a specific index, use that one, otherwise skip it
+            if arguments.name and indexData["short"].lower() not in arguments.name:
+                continue
+
+            utility.Load(file, equalize=False)
+
+            if indexData["normalize"]:
+                utility.normalize()
+
+            creationMethod = indexData["create"]
+
+            showImages = arguments.show
+            plot = arguments.plot
+
+            startTime = datetime.datetime.now()
+            vegIndex = creationMethod()
+            finishTime = datetime.datetime.now()
+            computeTime = finishTime - startTime
+            indexData["time"] = computeTime.microseconds
+            #print("Index: " + indexName + " " + str(computeTime))
+
+            if arguments.threshold is not None:
+                try:
+                    threshold = float(arguments.threshold)
+                except ValueError as ex:
+                    # If this can't be converted to a float, it must be in the supported set
+                    if arguments.threshold not in thresholdTechniques:
+                        print(f"Threshold must be in {thresholdTechniques} or a float")
+                        sys.exit(-1)
+                    else:
+                        threshold = arguments.threshold
+            else:
+                threshold = indexData["threshold"]
+
+            #threshold=None
+            direction = indexData["direction"]
+            negate = indexData["negate"]
+
+            if showImages:
+                utility.ShowImage("Index: " + indexName + " Threshold: " + str(threshold), vegIndex)
+
+            indexData["index"] = vegIndex
+
+            # if plot:
+            #     transectRow = vegIndex[100,:]
+            #     plt.figure()
+            #     plt.plot(transectRow)
+            #     plt.title(indexName)
+            #     plt.show()
+
+            # Force otsu
+            # if arguments.threshold:
+            #     threshold = None
+
+            # mask, thresholdUsed = utility.MaskFromIndex(vegIndex, negate, direction, threshold)
+            performance.start()
+            mask, thresholdUsed = utility.createMask(vegIndex, negate, direction, threshold)
+            #print(f"Using threshold {thresholdUsed}")
+            # Record the performance of the index creation
+            performance.stopAndRecord(indexName)
+
+            if arguments.refine:
+                mask = utility.refine()
+            # Determing threshold from image
+            #utility.MaskFromIndex(vegIndex)
+            if arguments.show:
+                normalized = np.zeros_like(mask)
+                finalMask = cv.normalize(mask, normalized, 0, 255, cv.NORM_MINMAX)
+                cv.imwrite(f"mask-{indexName}-{file}.jpg", finalMask)
+
+            utility.applyMask()
+
+            # This is the slow call
+            #image = veg.GetMaskedImage()
+            image = utility.GetImage()
+
+            indexData["masked"] = image
+
+            indexStats = utility.GetImageStats(image)
+            # For now, the only stat we care about is the vegetative pixel count
+            indexData["vegetativePixels"] = indexStats
+
+            #image = cv.medianBlur(image, 5)
+            if arguments.output is not None:
+                cv.imwrite(f"{arguments.output}/{Path(file).stem}-masked-{indexData['short']}.{arguments.encoding}", image)
+
+                # Unless the command line indicates otherwise, output the mask
+                if not arguments.no_mask:
+                    normalized = np.zeros_like(mask)
+                    # The main code uses None, so mirror that
+                    #finalMask = cv.normalize(mask, normalized, 0, 255, cv.NORM_MINMAX)
+                    finalMask = cv.normalize(mask, None, 0, 255, cv.NORM_MINMAX)
+                    finalMask = np.where(finalMask < 250, 0, 255)
+                    cv.imwrite(f"{arguments.masks}/{Path(file).stem}-mask-{indexData['short']}.{arguments.encoding}", finalMask)
+
+            if showImages:
+                utility.ShowImage(indexName + " mask applied to source with threshold: " + str(thresholdUsed), image)
+
+            if plot:
+                utility.plot(thresholdUsed)
+
+            utility.Unload()  # Debug memory leak

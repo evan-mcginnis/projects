@@ -1,0 +1,153 @@
+#
+# C A M E R A F I L E
+#
+import glob
+import pathlib
+import logging
+import logging.config
+import time
+from collections import deque
+import signal
+
+import numpy as np
+import os
+import cv2 as cv
+#from abc import ABC, abstractmethod
+
+
+
+import constants
+from ProcessedImage import ProcessedImage
+from Camera import Camera
+
+
+class CameraFile(Camera):
+    def __init__(self, **kwargs):
+        self._connected = False
+        self._directories = kwargs[constants.KEYWORD_DIRECTORY]
+        self._directory = self._directories[0]
+        self._type = kwargs[constants.KEYWORD_TYPE]
+        self._currentImage = 0
+        self._ignored = []
+        super().__init__(**kwargs)
+        self.log = logging.getLogger(__name__)
+        return
+
+    def connect(self) -> bool:
+        """
+        Connects to a directory and finds all images there. This method will not traverse subdirectories
+        :return:
+        """
+        self._connected = os.path.isdir(self._directory)
+        if not self._connected:
+            self.log.error("Unable to connect to directory: {}".format(self._directory))
+            raise NotADirectoryError(f"Unable to connect to directory: {self._directory}")
+        else:
+            self.log.debug("Connected to directory: {}".format(self._directory))
+
+        if self._connected:
+            # Images are .jpg files
+            if self._type == constants.ImageType.RGB.name:
+                pattern = "/*" + constants.EXTENSION_IMAGE
+            # Depth data are .npy files
+            elif self._type == constants.ImageType.DEPTH.name:
+                pattern = "/*" + constants.EXTENSION_NPY
+            else:
+                self.log.error("Can't process type: {}".format(self._type))
+            files = self._directory + pattern
+
+            # Get the file names, but ignore all files in the list of excluded files
+            self._flist = [fn for fn in glob.glob(files)
+                           if not os.path.basename(fn) in self._ignored]
+            #self._flist = [p for p in pathlib.Path(self.directory).iterdir() if p.is_file()]
+        return self._connected
+
+    def disconnect(self):
+        self._connected = False
+        return True
+
+    def diagnostics(self):
+        return True, "Camera diagnostics passed"
+
+    def initialize(self):
+        return
+
+    def start(self):
+        return
+
+    def capture(self) -> ProcessedImage:
+        """
+        Each time capture() is called, the next image in the directory is returned
+        :return:
+        The image as a numpy array.  Raises EOFError when no more images exist
+        """
+        imageName = ""
+        if self._currentImage < len(self._flist):
+            image = None
+            if self._type == constants.ImageType.RGB.name:
+                imageName = str(self._flist[self._currentImage])
+                image = cv.imread(imageName, cv.IMREAD_COLOR)
+                self._currentImage = self._currentImage + 1
+            elif self._type == constants.ImageType.DEPTH.name:
+                imageName = str(self._flist[self._currentImage])
+                image = np.load(imageName)
+            else:
+                self.log.error("Can't process type: {}".format(self._type))
+
+            processed = ProcessedImage(constants.ImageType.RGB, image, 0)
+            hasMetadata = processed.getMetadata(imageName)
+            processed.source = imageName
+
+            # If the corresponding depth info is present, read that as well
+            depthImageFilename = imageName.replace(constants.EXTENSION_IMAGE, constants.EXTENSION_NPY)
+            if os.path.isfile(depthImageFilename):
+                processed.depth = np.load(depthImageFilename)
+                self.log.debug(f"Loaded depth data from: {depthImageFilename}")
+            else:
+                # Probably not needed, but just to be complete
+                self.log.warning(f"Unable to find depth data: {depthImageFilename}")
+
+            return processed
+        # Raise an EOFError  when we get through the sequence of images
+        else:
+            raise EOFError
+
+    def getResolution(self) -> ():
+        # TODO: Get the first image and return the image size
+        #return self._flist[self._currentImage].shape()
+        return (0,0)
+
+    def getMMPerPixel(self) -> float:
+        return 0.5
+
+    @property
+    def ignored(self) -> []:
+        return self._ignored
+
+    @ignored.setter
+    def ignored(self, files: []):
+        self._ignored = files
+
+    @property
+    def directory(self) -> str:
+        return self._directory
+
+    @directory.setter
+    def directory(self, theDirectory: str):
+        print(f"Check directory for access: {theDirectory}")
+        if not os.path.isdir(theDirectory):
+            raise NotADirectoryError(f"Unable to access image directory {theDirectory}")
+
+        self._directory = theDirectory
+
+    @property
+    def type(self) -> str:
+        return self._type
+
+    @type.setter
+    def type(self, theType: str):
+        # Make sure it is one of the known types
+        self._type = constants.ImageType[theType].name
+
+if __name__ == "__main__":
+    print("No test method")
